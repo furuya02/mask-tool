@@ -1,0 +1,16 @@
+{
+  "name": "bedrock-nova2-metal-defect-inspection-cdk",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "cdk": "cdk"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "aws-cdk": "^2.1100.0",
+    "aws-cdk-lib": "^2.220.0",
+    "constructs": "^10.4.2",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}

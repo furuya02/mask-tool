@@ -1,0 +1,9 @@
+node_modules/
+cdk.out/
+cdk.context.json
+__pycache__/
+*.pyc
+.env
+.DS_Store
+result_*.png
+.claude/settings.local.json
