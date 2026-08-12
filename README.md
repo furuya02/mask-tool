@@ -53,6 +53,25 @@ the value — a wider box, but a reliable one.
 Transcription itself varies between runs, so it is repeated 3 times by default and the
 results are merged (`--ocr-passes`). Pass `--no-digit-scan` to skip this pass entirely.
 
+#### When the digits are split across two lines
+
+A long value such as a subnet ARN wraps, and the account ID can end up split — the last
+few digits at the end of one line, the rest at the start of the next. Neither line
+contains 12 consecutive digits on its own, so a line-by-line check finds nothing.
+
+So lines are also joined in pairs and checked. When a 12-digit run **crosses the join**,
+both lines are masked whole. Lines are treated as a wrapped pair only when the second sits
+directly below the first and their horizontal ranges overlap, so columns sitting side by
+side are never joined.
+
+Pairs are found by position, not by reading order. In a multi-column layout such as an AWS
+console detail panel, a line from a neighbouring column often falls between the two halves
+of a wrapped value when everything is sorted top to bottom, so only comparing consecutive
+lines would miss it.
+
+Two unrelated lines can still form 12 digits by coincidence, which results in more being
+masked than necessary — the safe direction to err in.
+
 ### Deciding what was actually missed
 
 When the masked image is sent back for verification, Nova sometimes infers the value that
@@ -80,6 +99,19 @@ Image input is billed at a flat 230 tokens per image regardless of resolution
 ([Multimodal understanding](https://docs.aws.amazon.com/nova/latest/nova2-userguide/using-multimodal-models.html)).
 Downscaling would therefore save nothing while making small text harder to read, so images
 are sent as they are. Only images too large for the request are shrunk until they fit.
+
+### Saved images are resized to 900px wide
+
+Screenshots are usually too large to embed in an article as they are, so the saved image is
+resized to at most **900px wide**, keeping the aspect ratio (`--max-width`, `0` disables it).
+
+Detection, masking and verification all run at the original resolution — the resize is
+applied last, so it never costs accuracy. **Images with nothing masked are resized too**,
+so every file ends up the same width. Images already at or below the limit are left
+untouched rather than re-encoded, and the backup always keeps the original size.
+
+The only exception is an image whose detection result could not be parsed. That file is
+left at its original size so a retry can run at full resolution.
 
 ## Requirements
 
@@ -141,6 +173,7 @@ Found 3 images:
 
 Model:   jp.amazon.nova-2-lite-v1:0 (ap-northeast-1)
 Style:   pixelate
+Width:   max 900px
 Backup:  bak/
 
 Note: 3 image(s) will be sent to Amazon Bedrock, several calls per image. Charges apply per token.
@@ -169,8 +202,9 @@ image needs review.
 
 ```
 usage: mask-tool [-h] [-d DIRECTORY] [-s {pixelate,blur,black}] [-n]
-                 [--ocr-passes OCR_PASSES] [--no-digit-scan] [--no-screen]
-                 [--no-verify] [--padding-x PADDING_X] [--padding-y PADDING_Y]
+                 [--max-width MAX_WIDTH] [--ocr-passes OCR_PASSES]
+                 [--no-digit-scan] [--no-screen] [--no-verify]
+                 [--padding-x PADDING_X] [--padding-y PADDING_Y]
                  [--max-tokens MAX_TOKENS] [--region REGION] [--model MODEL] [-v]
 ```
 
@@ -179,6 +213,7 @@ usage: mask-tool [-h] [-d DIRECTORY] [-s {pixelate,blur,black}] [-n]
 | `-d`, `--directory` | current directory | Directory containing the images |
 | `-s`, `--style` | `pixelate` | How to hide values (`pixelate` / `blur` / `black`) |
 | `-n`, `--dry-run` | - | Detect and verify without modifying any file |
+| `--max-width` | `900` | Resize the saved image to at most this width (`0` disables) |
 | `--ocr-passes` | `3` | How many times to transcribe for the 12-digit scan |
 | `--no-digit-scan` | - | Skip the 12-digit scan |
 | `--no-screen` | - | Skip screening and run detection on every image |
@@ -202,6 +237,12 @@ mask-tool --dry-run
 
 ```bash
 mask-tool -d /path/to/screenshots
+```
+
+**Keep the original size:**
+
+```bash
+mask-tool --max-width 0
 ```
 
 **Replace the pixels with solid black — the most certain option:**
@@ -277,9 +318,17 @@ A failure on one image does not stop the rest of the folder.
 Nothing runs continuously on AWS, so there is no idle cost. The only charge is Bedrock
 usage, and the estimated cost of each run is printed at the end.
 
-With the defaults, each image takes up to six calls (three transcriptions, screening,
-detection, verification) — roughly $0.002 per image. Images with more findings produce
-more output tokens, so run a few first to get a feel for your own per-image cost.
+With the defaults, each image takes up to six calls: three transcriptions, screening,
+detection and verification.
+
+A measured run over six dense AWS console screenshots came to **$0.13 — about $0.02 per
+image** (28 calls, 13,774 input and 37,421 output tokens). Output tokens dominate: the
+transcription pass reproduces every line of text in the image, and it runs three times by
+default.
+
+Cost therefore scales with how much text an image contains, not with its resolution. Plain
+screenshots cost far less than a dense console page. Lower `--ocr-passes` (or pass
+`--no-digit-scan`) to cut it, at the cost of missing more.
 
 Nova 2 Lite in the Tokyo region is priced at $0.396 per 1M input tokens and $3.311 per 1M
 output tokens.
