@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mask-tool"
-version = "0.2.0"
+version = "0.3.1"
 description = "A tool to mask credentials in sequentially numbered PNG files using Amazon Nova 2 Lite"
 readme = "README.md"
 license = "MIT"

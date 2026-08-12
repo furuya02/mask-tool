@@ -9,6 +9,8 @@ Amazon Bedrock の Amazon Nova 2 Lite で認証情報を検出し、該当領域
 処理フロー（画像 1 枚あたり）:
   1. 12 桁スキャン   テキストを文字起こしして、正規表現で 12 桁の数字を含む行を拾う
                      （判定をモデルに委ねないため確実。該当行はまるごとマスクする）
+                     折り返しで 12 桁が 2 行に分断される場合に備え、隣接行を連結した
+                     文字列も判定し、境界をまたぐ並びがあれば両方の行をマスクする
   2. スクリーニング  認証情報があるかだけを判定。無ければ検出を省略（コスト削減）
   3. 検出            認証情報のバウンディングボックスを [0,1000] 正規化座標で取得
   4. マスク          Pillow で塗り潰し（座標を実寸へ変換し、パディングを付与）
@@ -23,6 +25,11 @@ Amazon Bedrock の Amazon Nova 2 Lite で認証情報を検出し、該当領域
     Nova 2 Lite の画像入力は解像度によらず一律 230 トークンで課金されるため、
     縮小してもコストは下がらず、小さい文字の読み取り精度を落とすだけになる。
     送信サイズの上限を超える画像だけ、収まるところまで縮小する。
+
+保存時の縮小:
+    保存する画像は、既定で横幅 900px 以内になるよう縦横比を保って縮小する（--max-width）。
+    検出・マスク・再検証はすべて原寸で行い、縮小は最後に適用する。
+    マスク対象が無かった画像も同じように縮小して書き戻す。
 """
 
 import argparse
@@ -83,9 +90,18 @@ DEFAULT_OCR_PASSES = 3
 # Converse API に渡せる画像サイズの目安。これを超える画像だけ縮小する。
 MAX_IMAGE_BYTES = 4_000_000
 
+# 出力画像の最大幅。これより広い画像は縦横比を保ったまま縮小して保存する。
+# 検出とマスクは原寸のまま行い、縮小は最後に適用する（精度を落とさないため）。
+# マスク対象が無かった画像も同じように縮小する。
+DEFAULT_MAX_WIDTH = 900
+
 # 12 桁の数字。AWS コンソールでは 1234-5678-9012 のように区切って表示されることが
 # あるため、ハイフンや空白で区切られた形も拾う。
 DIGIT_RUN = re.compile(r"\d{12}|\d{4}[\s-]\d{4}[\s-]\d{4}")
+
+# 折り返しとみなす行間の上限（直前の行の高さに対する倍率）。
+# ARN のような長い値は折り返され、12 桁が行末と次行先頭に分断されることがある。
+WRAP_MAX_GAP_RATIO = 1.5
 
 # 認証・権限の問題は全画像で再現するため、検出した時点で処理全体を中断する
 FATAL_ERROR_CODES = {
@@ -387,6 +403,55 @@ def locate_texts(
     return hits
 
 
+def line_entries(lines: list[Any]) -> list[dict[str, Any]]:
+    """文字起こし結果から、テキストと座標が揃った行だけを読み順で取り出す。"""
+    entries: list[dict[str, Any]] = []
+    for line in lines:
+        if not isinstance(line, dict):
+            continue
+        text, bbox = line.get("text", ""), line.get("bbox")
+        if isinstance(text, str) and text and valid_bbox(bbox):
+            entries.append({"text": text, "bbox": list(bbox)})
+    return sorted(entries, key=lambda entry: (entry["bbox"][1], entry["bbox"][0]))
+
+
+def is_wrapped(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    """
+    second が first の折り返しの続きとみなせるか判定する。
+
+    値が長いと 1 行に収まらず折り返される。折り返し行は、直前の行のすぐ下にあり、
+    横方向の範囲が重なる。左右に並んだ別の列を誤って連結しないための条件でもある。
+    """
+    fx1, fy1, fx2, fy2 = first["bbox"]
+    sx1, sy1, sx2, sy2 = second["bbox"]
+
+    height = fy2 - fy1
+    if height <= 0:
+        return False
+
+    # 次の行が下にあり、行間が離れすぎていないこと。
+    # 枠がわずかに重なって返ることがあるため、少しの食い込みは許容する。
+    gap = sy1 - fy2
+    if not -height * 0.5 <= gap <= height * WRAP_MAX_GAP_RATIO:
+        return False
+
+    # 横方向に重なっていること
+    return bool(min(fx2, sx2) > max(fx1, sx1))
+
+
+def spans_boundary(first_text: str, second_text: str) -> bool:
+    """
+    2 行を連結したとき、その境界をまたぐ 12 桁の並びがあるか調べる。
+
+    折り返しによって 12 桁が行末と次行先頭に分断されると、行単位の判定では
+    どちらにも一致しない。連結してから判定し、かつ一致が境界をまたぐものだけを
+    拾うことで、行単体で完結する一致との二重計上を避ける。
+    """
+    combined = first_text + second_text
+    split = len(first_text)
+    return any(m.start() < split < m.end() for m in DIGIT_RUN.finditer(combined))
+
+
 def scan_once(
     client: Any,
     args: argparse.Namespace,
@@ -398,22 +463,52 @@ def scan_once(
     lines = items_of(data, "lines")
 
     # 座標付きで返ってきた場合はそのまま使う
-    hits: list[dict[str, Any]] = []
-    for line in lines:
-        if not isinstance(line, dict):
-            continue
-        text, bbox = line.get("text", ""), line.get("bbox")
-        if valid_bbox(bbox) and DIGIT_RUN.search(str(text)):
-            hits.append({"category": "digits12", "text": text, "bbox": bbox})
+    entries = line_entries(lines)
+    hits: list[dict[str, Any]] = [
+        {"category": "digits12", "text": entry["text"], "bbox": entry["bbox"]}
+        for entry in entries
+        if DIGIT_RUN.search(entry["text"])
+    ]
+
+    # 折り返しで 12 桁が 2 行に分断されているケース。
+    # ARN のような長い値では行末と次行先頭に分かれるため、行単位では一致しない。
+    # 連結して境界をまたぐ並びを見つけたら、両方の行をマスク対象にする。
+    #
+    # 多段組みの画面では、折り返し行のあいだに別カラムの行が y 座標的に挟まる。
+    # そのため並び順で隣り合う行だけを見ても見つからない。組み合わせは位置関係
+    # （is_wrapped）で絞れるので、行数は多くないことも踏まえて総当たりする。
+    for first in entries:
+        for second in entries:
+            if first is second:
+                continue
+            if is_wrapped(first, second) and spans_boundary(first["text"], second["text"]):
+                hits.append({"category": "digits12-wrapped", "text": first["text"],
+                             "bbox": first["bbox"]})
+                hits.append({"category": "digits12-wrapped", "text": second["text"],
+                             "bbox": second["bbox"]})
+
     if hits:
-        return hits
+        return dedupe_hits(hits)
+
+    # 座標付きで返っていたのに該当が無いなら、この画像には無かったということ。
+    # ここで聞き直すと、座標を使った折り返し判定を迂回してしまう。
+    if entries:
+        return []
 
     # 座標なし（文字列だけ）で返ることがある。その場合は該当行の位置を聞き直す。
-    targets: list[str] = []
-    for line in lines:
-        text = line.get("text", "") if isinstance(line, dict) else line
-        if isinstance(text, str) and DIGIT_RUN.search(text):
-            targets.append(text)
+    texts = [
+        line.get("text", "") if isinstance(line, dict) else line
+        for line in lines
+    ]
+    texts = [text for text in texts if isinstance(text, str) and text]
+
+    targets: list[str] = [text for text in texts if DIGIT_RUN.search(text)]
+    # 座標が無いと折り返しかどうかは判断できないため、並び順で隣り合う行を連結して調べる
+    for first_text, second_text in zip(texts, texts[1:], strict=False):
+        if spans_boundary(first_text, second_text):
+            targets += [first_text, second_text]
+
+    targets = list(dict.fromkeys(targets))
     if not targets:
         return []
     return locate_texts(client, args, image_bytes, targets, usage)
@@ -552,6 +647,47 @@ def drop_hallucinations(
     return real
 
 
+def shrink_to_width(image: Image.Image, max_width: int) -> Image.Image | None:
+    """
+    最大幅を超える画像を、縦横比を保ったまま縮小する。
+
+    Args:
+        image: 対象の画像
+        max_width: 出力の最大幅。0 以下なら縮小しない
+
+    Returns:
+        縮小した画像。縮小が不要なら None
+    """
+    if max_width <= 0 or image.width <= max_width:
+        return None
+    height = max(1, round(image.height * max_width / image.width))
+    return image.resize((max_width, height), Image.Resampling.LANCZOS)
+
+
+def write_output(
+    image: Image.Image,
+    image_path: Path,
+    backup_dir: Path | None,
+    max_width: int,
+    masked: bool,
+) -> None:
+    """
+    処理結果を元のパスへ書き戻す。
+
+    マスクの有無にかかわらず、最大幅を超える画像は縮小して保存する。
+    マスクもされず縮小も不要な場合は、無駄な書き換えを避けるため何もしない。
+    backup_dir が None のとき（ドライラン）は一切書き込まない。
+    """
+    if backup_dir is None:
+        return
+
+    shrunk = shrink_to_width(image, max_width)
+    if shrunk is not None:
+        shrunk.save(image_path)
+    elif masked:
+        image.save(image_path)
+
+
 def process_image(
     client: Any,
     image_path: Path,
@@ -561,6 +697,9 @@ def process_image(
 ) -> Result:
     """
     画像 1 枚をバックアップし、認証情報をマスクして上書きする。
+
+    マスク対象が無かった画像も、最大幅を超えていれば縮小して書き戻す。
+    検出結果を解析できなかった場合だけは、原寸のまま再実行できるよう手を付けない。
 
     backup_dir が None の場合（ドライラン）はバックアップも上書きも行わず、
     検出と再検証だけを実施する。
@@ -589,6 +728,7 @@ def process_image(
         )
         # 判定できなかったときは検出へ進める（対象なしと決めつけない）
         if isinstance(screened, dict) and not screened.get("has_credentials"):
+            write_output(image, image_path, backup_dir, args.max_width, masked=False)
             return Result("clean", 0, 0, [])
 
     detected = converse(
@@ -608,15 +748,17 @@ def process_image(
     findings = merge_findings(findings, digit_hits)
 
     if not findings:
+        write_output(image, image_path, backup_dir, args.max_width, masked=False)
         return Result("clean", 0, len(digit_hits), [])
 
     boxes = apply_mask(image, findings, args.padding_x, args.padding_y, args.style)
     if not boxes:
+        write_output(image, image_path, backup_dir, args.max_width, masked=False)
         return Result("clean", 0, len(digit_hits), [])
 
+    # 再検証は縮小前の画像に対して行う（小さくすると読み取り精度が落ちるため）
     masked_bytes = to_request_bytes(image)
-    if backup_dir is not None:
-        image.save(image_path)
+    write_output(image, image_path, backup_dir, args.max_width, masked=True)
 
     if args.no_verify:
         return Result("masked", len(boxes), len(digit_hits), [])
@@ -673,6 +815,14 @@ def build_parser() -> argparse.ArgumentParser:
         "-n", "--dry-run",
         action="store_true",
         help="Show what would be masked without modifying any file"
+    )
+    parser.add_argument(
+        "--max-width",
+        type=int,
+        default=DEFAULT_MAX_WIDTH,
+        help=f"Resize the saved image so it is at most this wide, keeping the aspect ratio. "
+             f"Applies to images with nothing masked as well. 0 disables resizing "
+             f"(default: {DEFAULT_MAX_WIDTH})"
     )
     parser.add_argument(
         "--ocr-passes",
@@ -767,6 +917,7 @@ def main() -> int:
 
     print(f"Model:   {args.model} ({args.region})")
     print(f"Style:   {args.style}")
+    print(f"Width:   {f'max {args.max_width}px' if args.max_width > 0 else 'unchanged'}")
     print(f"Backup:  {'(dry run - not saved)' if backup_dir is None else backup_dir.name + '/'}")
     print(
         f"\nNote: {len(images)} image(s) will be sent to Amazon Bedrock, "
